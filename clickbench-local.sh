@@ -156,6 +156,21 @@ assert_daemon_can_read() {
     die  "Check the mode of every parent directory: ls -ld \$(namei -l $path)"
 }
 
+# Upstream clickhouse/load runs
+#     sudo chown -h clickhouse:clickhouse /var/lib/clickhouse/user_files/hits_*.parquet
+#     sudo rm -f                          /var/lib/clickhouse/user_files/hits_*.parquet
+# where the glob is expanded by the calling shell, not by sudo. Those
+# directories are 0700/0750 clickhouse:clickhouse, so for a non-root caller the
+# pattern stays literal: chown fails and `set -e` aborts the load. Upstream runs
+# as root via cloud-init and never sees it. Grant the least that makes the
+# unmodified upstream script work — traverse on the data dir, list on
+# user_files; the per-table directories below stay unreadable.
+allow_user_files_glob() {
+    [ -d /var/lib/clickhouse/user_files ] || return 0
+    sudo chmod o+x  /var/lib/clickhouse
+    sudo chmod o+rx /var/lib/clickhouse/user_files
+}
+
 ###############################################################################
 # STEP: preflight — is this box able to run the benchmark honestly?
 ###############################################################################
@@ -266,6 +281,7 @@ step_install_clickhouse() {
     say "Installing ClickHouse"
     cd "$SYS_DIR"
     ./install
+    allow_user_files_glob
     echo
     clickhouse-client --version || true
     echo
@@ -279,11 +295,15 @@ step_install_clickhouse() {
 step_start() {
     say "Starting the server and probing it"
     cd "$SYS_DIR"
-    ./start
+    # `clickhouse start` exits 2 when the server is already up. lib/benchmark-common.sh
+    # ignores ./start's status for the same reason and treats ./check as the
+    # authoritative readiness signal; do the same here.
+    ./start || true
     # ./check is just `clickhouse-client --query "SELECT 1"`. The driver polls
     # it for up to 300 s after every restart.
     for _ in $(seq 1 60); do ./check >/dev/null 2>&1 && break; sleep 1; done
-    ./check && echo "Server is up."
+    ./check || die "Server did not become ready within 60 s."
+    echo "Server is up."
     clickhouse-client --query "SELECT version(), uptime()"
 }
 
@@ -299,7 +319,7 @@ ensure_server_up() {
     cd "$SYS_DIR"
     ./check >/dev/null 2>&1 && return 0
     say "Server is down (the driver stops it at the end of a run) — starting it"
-    ./start
+    ./start || true
     for _ in $(seq 1 60); do ./check >/dev/null 2>&1 && return 0; sleep 1; done
     return 1
 }
@@ -345,6 +365,7 @@ step_download() {
 step_load() {
     say "Loading the dataset (this is the same ./load the driver times)"
     cd "$SYS_DIR"
+    allow_user_files_glob
     assert_daemon_can_read "$SYS_DIR/hits_0.parquet"
     local t0 t1
     t0=$(date +%s.%N)
@@ -376,6 +397,7 @@ step_load() {
 step_bench() {
     say "Running the full benchmark — output is tee'd to $LOG"
     cd "$SYS_DIR"
+    allow_user_files_glob
 
     : > "$LOG"
     {
