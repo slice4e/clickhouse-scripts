@@ -105,10 +105,11 @@ SG_NAME="${SG_NAME:-clickbench-cluster}"
 PG_NAME="${PG_NAME:-clickbench-cluster}"
 TAG_NAME="${TAG_NAME:-clickbench-cluster}"
 
-# Where the node-side checkout lives. Same reasoning as the single-node
-# script: NOT under a 0700 home directory, because clickhouse-server reads the
-# parquet files as the unprivileged 'clickhouse' user.
-NODE_WORK_DIR="${NODE_WORK_DIR:-/var/lib/clickbench}"
+# Where the node-side checkout lives. Only the ClickBench checkout and the
+# generated system directory go here — the parquet files are downloaded
+# straight into /var/lib/clickhouse/user_files by node-install.sh — so the
+# ssh user's home directory is fine.
+NODE_WORK_DIR="${NODE_WORK_DIR:-/home/$SSH_USER/clickbench}"
 
 NODES_FILE="$BASE_DIR/nodes.env"
 LOG="$BASE_DIR/cluster-log"
@@ -286,7 +287,7 @@ EOF
 # so run clickbench-local.sh fetch first (or set CB_DIR).
 ###############################################################################
 step_gen() {
-    local cb_dir="${CB_DIR:-$NODE_WORK_DIR/ClickBench}"
+    local cb_dir="${CB_DIR:-$BASE_DIR/ClickBench}"
     [ -d "$cb_dir/clickhouse" ] || die "No ClickBench checkout at $cb_dir — run ./clickbench-local.sh fetch, or set CB_DIR."
 
     say "Generating $GEN_DIR"
@@ -356,7 +357,7 @@ set -e
 i=0
 pids=()
 for host in $CB_NODES; do
-    on_node "$host" "sudo bash -s -- $i $CB_NODE_COUNT $CB_CLUSTER $CB_WORK_DIR $CB_NODES" \
+    on_node "$host" "sudo bash -s -- $i $CB_NODE_COUNT $CB_CLUSTER $CB_NODES" \
         < ./node-install.sh &
     pids+=($!)
     i=$((i + 1))
@@ -369,9 +370,9 @@ EOF
     cat > "$GEN_DIR/node-install.sh" <<'EOF'
 #!/bin/bash
 # Runs as root on each cluster node, fed to `sudo bash -s` over ssh by ./install.
-# Args: <node-index> <node-count> <cluster-name> <work-dir> <node-ip>...
+# Args: <node-index> <node-count> <cluster-name> <node-ip>...
 set -e
-IDX="$1"; N="$2"; CLUSTER="$3"; WORK_DIR="$4"; shift 4
+IDX="$1"; N="$2"; CLUSTER="$3"; shift 3
 NODES="$*"
 PRIVATE_IP=$(hostname -I | awk '{print $1}')
 
@@ -418,7 +419,7 @@ YAML
 # of the 100 partitioned parquet files. Straight into user_files, so the server
 # can read them with no symlink and no traversal problem.
 DEST=/var/lib/clickhouse/user_files
-mkdir -p "$DEST" "$WORK_DIR"
+mkdir -p "$DEST"
 cd "$DEST"
 seq 0 99 | awk -v n="$N" -v i="$IDX" '($1 % n) == i' \
     | xargs -P16 -I{} wget --continue --quiet \
@@ -584,7 +585,7 @@ step_bootstrap() {
     ssh_pub "$pub0" "for h in $CB_NODES; do ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \$h true && echo \"  -> \$h ok\"; done"
 
     say "Cloning ClickBench on node0 into $NODE_WORK_DIR"
-    ssh_pub "$pub0" "sudo mkdir -p $NODE_WORK_DIR && sudo chown $SSH_USER:$SSH_USER $NODE_WORK_DIR && sudo chmod 755 $NODE_WORK_DIR && \
+    ssh_pub "$pub0" "mkdir -p $NODE_WORK_DIR && \
         { [ -d $NODE_WORK_DIR/ClickBench/.git ] || git clone --depth 1 https://github.com/ClickHouse/ClickBench.git $NODE_WORK_DIR/ClickBench; }"
 
     say "Pushing $SYSTEM/ to node0"
@@ -708,7 +709,7 @@ step_results() {
 # STEP: submit — validate and print the contribution checklist
 ###############################################################################
 step_submit() {
-    local cb_dir="${CB_DIR:-$NODE_WORK_DIR/ClickBench}"
+    local cb_dir="${CB_DIR:-$BASE_DIR/ClickBench}"
     say "Validating the result file"
     if [ -f "$cb_dir/validate-results.py" ]; then
         # The validator walks <system>/results/*/*.json relative to a root, so
@@ -795,6 +796,8 @@ step_help() {
 #   NODE_COUNT=5               shards
 #   KEY_NAME / SSH_KEY         EC2 key pair and the matching .pem
 #   CB_DIR=/path/to/ClickBench checkout used by gen and submit
+#                              (defaults to ./ClickBench, made by clickbench-local.sh fetch)
+#   NODE_WORK_DIR=/mnt/clickbench   where the checkout lives on the nodes
 #   BENCH_TRIES / BENCH_CONCURRENT_DURATION are set on node0, not here:
 #       ssh0, then: BENCH_TRIES=1 BENCH_CONCURRENT_DURATION=0 ./benchmark.sh
 EOF

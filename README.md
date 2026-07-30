@@ -21,8 +21,8 @@ upstream driver.
 ```
 
 Run it on a fresh EC2 instance and it produces a result JSON of the same shape
-the ClickBench fleet publishes. Use `MACHINE=c7i.4xlarge` so the `machine` field
-is the real instance type.
+the ClickBench fleet publishes; the `machine` field is read from the instance
+metadata service, so it is the real instance type (override with `MACHINE=`).
 
 ## `clickbench-cluster.sh` — 3-node cluster on AWS
 
@@ -37,8 +37,11 @@ builds a result with `cluster_size: 3`.
 
 ## Notes
 
-- The work directory defaults to `/var/lib/clickbench`, deliberately not under
-  `$HOME`: `clickhouse-server` reads the parquet files as the unprivileged
-  `clickhouse` user and cannot traverse a `0700` home directory.
+- Run both scripts as an ordinary user with sudo rights (the `ubuntu` user on a
+  stock EC2 image); the privileged commands call `sudo` themselves.
+- The ClickBench checkout and the dataset live in this directory
+  (override with `WORK_DIR=`). `clickhouse-server` reads the parquet files as
+  the unprivileged `clickhouse` user, so `preflight` adds the missing `o+x`
+  bits to the parent directories — Ubuntu creates home directories `0750`.
 - `nodes.env` holds node addresses and is generated per deployment — it is
   gitignored and must never be committed.

@@ -62,20 +62,21 @@
 # the "hot" numbers. That restart-per-query is why a full run is long.
 #
 # ---------------------------------------------------------------------------
-# WHAT "PUBLISHABLE" MEANS (relevant for step 2 on AWS)
+# WHAT "PUBLISHABLE" MEANS
 #
 # Official results come from run-benchmark.sh, which boots a *fresh* Ubuntu
 # 24.04 EC2 VM with a 500 GB gp2 root volume, feeds it cloud-init.sh, runs
 # benchmark.sh unattended, ships the log to play.clickhouse.com, and a bot
 # turns that log into clickhouse/results/<YYYYMMDD>/<machine>.json.
 #
-# This local run reproduces the *measurement*, not the *environment*:
-#   - this box is not an AWS instance type, so the "machine" field would be
-#     meaningless on the dashboard -> DO NOT submit local results upstream;
-#   - this box is much bigger than the c6a.4xlarge reference (see preflight);
-#   - it is a shared/interactive machine, so background noise is possible.
-# Use it to learn the flow and to profile ClickHouse. The publishable run
-# comes later, on dedicated EC2 instances.
+# This script reproduces the same measurement by hand. On a dedicated EC2
+# instance the numbers are directly comparable: the `machine` field is picked
+# up from the instance metadata service, so the result JSON carries a real
+# instance type. Off EC2 it falls back to a hostname label, which is fine for
+# study but is not something the dashboard can place.
+#
+# It must be run as an ordinary user with sudo rights (the `ubuntu` user on a
+# stock EC2 image); the individual privileged commands call sudo themselves.
 ###############################################################################
 
 set -euo pipefail
@@ -85,17 +86,18 @@ set -euo pipefail
 #     BENCH_CONCURRENT_DURATION=0 BENCH_TRIES=3 ./clickbench-local.sh bench
 # ---------------------------------------------------------------------------
 
-# Where everything lives.
+# Where everything lives: everything is kept inside this script's own
+# directory, so a plain `git clone && ./clickbench-local.sh all` in $HOME works.
 #
-# NOT under $HOME on purpose. clickhouse/load symlinks the parquet files into
-# /var/lib/clickhouse/user_files/ and the server — running as the unprivileged
-# 'clickhouse' user — follows those symlinks. /root is mode 0700, so anything
-# below it is unreachable for that user and the INSERT dies with
+# The one requirement is that the 'clickhouse' system user can *traverse* down
+# to the parquet files: clickhouse/load symlinks them into
+# /var/lib/clickhouse/user_files/ and the server follows those symlinks as that
+# unprivileged user. A 0700/0750 directory on the way (Ubuntu creates home
+# directories 0750) makes the INSERT fail with
 #   filesystem error: in posix_stat: ... Permission denied ["...hits_70.parquet"]
-# Upstream never sees this because cloud-init clones into /ClickBench.
-# Any world-traversable path works: /var/lib/clickbench, /srv/..., /mnt/....
+# so preflight adds the missing o+x bits — see ensure_traversable below.
 BASE_DIR="${BASE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
-WORK_DIR="${WORK_DIR:-/var/lib/clickbench}"        # repo checkout + dataset
+WORK_DIR="${WORK_DIR:-$BASE_DIR}"                  # repo checkout + dataset
 CB_DIR="$WORK_DIR/ClickBench"                      # the git checkout
 SYSTEM="${SYSTEM:-clickhouse}"                     # which ClickBench system dir
 SYS_DIR="$CB_DIR/$SYSTEM"
@@ -103,16 +105,22 @@ SYS_DIR="$CB_DIR/$SYSTEM"
 CB_REPO="${CB_REPO:-https://github.com/ClickHouse/ClickBench.git}"
 CB_BRANCH="${CB_BRANCH:-main}"
 
-# Label for the result JSON. Upstream this is an EC2 instance type. Locally we
-# use something obviously non-EC2 so a local file can never be mistaken for a
-# publishable one.
-MACHINE="${MACHINE:-local-$(hostname)}"
+# Label for the result JSON — upstream this is the EC2 instance type, so take
+# it from the instance metadata service when we are on EC2.
+ec2_instance_type() {
+    local token
+    token=$(curl -fsS -m 1 -X PUT http://169.254.169.254/latest/api/token \
+            -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' 2>/dev/null) || return 1
+    curl -fsS -m 1 -H "X-aws-ec2-metadata-token: $token" \
+        http://169.254.169.254/latest/meta-data/instance-type 2>/dev/null
+}
+MACHINE="${MACHINE:-$(ec2_instance_type || echo "local-$(hostname)")}"
 
 # Driver knobs (read by lib/benchmark-common.sh). Defaults shown are upstream's.
 export BENCH_TRIES="${BENCH_TRIES:-3}"                                 # runs per query
 export BENCH_CONCURRENT_CONNECTIONS="${BENCH_CONCURRENT_CONNECTIONS:-10}"
 export BENCH_CONCURRENT_DURATION="${BENCH_CONCURRENT_DURATION:-600}"   # 0 = skip QPS test
-export HOME="${HOME:-/root}"                                           # driver expects a real HOME
+export HOME="${HOME:-$(getent passwd "$(id -u)" | cut -d: -f6)}"        # driver expects a real HOME
 
 LOG="$SYS_DIR/log"                                 # full benchmark log
 
@@ -124,17 +132,28 @@ warn() { printf '\033[1;33m[warn] %s\033[0m\n' "$*" >&2; }
 die()  { printf '\033[1;31m[fail] %s\033[0m\n' "$*" >&2; exit 1; }
 
 # The server reads the dataset as the 'clickhouse' user, so every directory on
-# the way to the parquet files must be traversable by it.
+# the way to the parquet files must be traversable by it. Add the missing o+x
+# bits rather than moving the data somewhere else; o+x on a directory grants
+# traversal only, not the right to list it.
+ensure_traversable() {
+    local dir="$1"
+    while [ "$dir" != "/" ]; do
+        if [ ! "$(stat -c %A "$dir" | cut -c10)" = "x" ]; then
+            say "Making $dir traversable for the clickhouse user (chmod o+x)"
+            sudo chmod o+x "$dir"
+        fi
+        dir=$(dirname "$dir")
+    done
+}
+
 assert_daemon_can_read() {
     local path="$1"
     id clickhouse >/dev/null 2>&1 || return 0     # not installed yet
     sudo -u clickhouse test -r "$path" && return 0
+    ensure_traversable "$(dirname "$path")"
+    sudo -u clickhouse test -r "$path" && return 0
     warn "User 'clickhouse' cannot read $path"
-    warn "Check the mode of every parent directory: ls -ld \$(namei -l $path)"
-    die  "Move the work directory somewhere traversable, e.g.
-       sudo mkdir -p /var/lib/clickbench && sudo chmod 755 /var/lib/clickbench
-       sudo mv $CB_DIR /var/lib/clickbench/
-       sudo rm -f /var/lib/clickhouse/user_files/hits_*.parquet"
+    die  "Check the mode of every parent directory: ls -ld \$(namei -l $path)"
 }
 
 ###############################################################################
@@ -143,20 +162,25 @@ assert_daemon_can_read() {
 step_preflight() {
     say "Preflight"
 
+    # Everything privileged goes through sudo; running the whole script as root
+    # is not needed and leaves root-owned files in the work directory.
+    if [ "$(id -u)" -eq 0 ]; then
+        warn "Running as root. This script is meant to be run as an ordinary user with sudo rights."
+    fi
+    sudo true || die "sudo is required — the privileged steps call it directly."
+
     # ClickBench standardises on Ubuntu 24.04+. Older is usually fine for
     # ClickHouse itself (the installer ships a static binary), but note it.
     . /etc/os-release
     echo "OS:        $PRETTY_NAME"
-    [[ "$VERSION_ID" < "24.04" ]] && \
+    if [[ "$VERSION_ID" < "24.04" ]]; then
         warn "ClickBench standardises on Ubuntu 24.04+; you are on $VERSION_ID."
+    fi
 
     echo "CPU:       $(nproc) logical cores — $(lscpu | sed -n 's/^Model name: *//p' | head -1)"
     echo "RAM:       $(free -g | awk '/^Mem:/ {print $2}') GiB"
+    echo "Machine:   $MACHINE"
     echo "Reference: $REF_MACHINE"
-    echo
-    echo "This box is far larger than the reference machine, so absolute times"
-    echo "will look great and mean little. What is comparable is the *shape*:"
-    echo "which queries are I/O bound, which scale with cores, cold vs hot."
 
     # Space: ~14 GB of parquet + ~15 GB of MergeTree data + room for merges.
     local avail_work avail_var
@@ -166,12 +190,13 @@ step_preflight() {
     echo
     echo "Free space in $WORK_DIR: ${avail_work} GiB (need ~20 for the parquet dataset)"
     echo "Free space in /var:      ${avail_var} GiB (need ~30 for /var/lib/clickhouse)"
-    (( avail_work < 25 )) && die "Not enough space for the dataset."
-    (( avail_var  < 35 )) && die "Not enough space for /var/lib/clickhouse."
+    (( avail_work >= 25 )) || die "Not enough space for the dataset."
+    (( avail_var  >= 35 )) || die "Not enough space for /var/lib/clickhouse."
 
-    # A 0700 directory anywhere above the dataset breaks the load step.
+    # A non-traversable directory anywhere above the dataset breaks the load
+    # step; Ubuntu creates home directories 0750, so this usually fixes one.
     say "Checking that the clickhouse user can reach $WORK_DIR"
-    chmod 755 "$WORK_DIR"
+    ensure_traversable "$WORK_DIR"
     assert_daemon_can_read "$WORK_DIR" && echo "OK — path is traversable."
 
     # The driver drops the page cache before every cold run. Without this the
@@ -206,18 +231,11 @@ step_deps() {
 step_fetch() {
     say "Fetching ClickBench into $CB_DIR"
     mkdir -p "$WORK_DIR"
-    chmod 755 "$WORK_DIR"
     if [ -d "$CB_DIR/.git" ]; then
         git -C "$CB_DIR" fetch --depth 1 origin "$CB_BRANCH"
         git -C "$CB_DIR" reset --hard "origin/$CB_BRANCH"
     else
         git clone --depth 1 "$CB_REPO" --branch "$CB_BRANCH" "$CB_DIR"
-    fi
-
-    # Keep it reachable from the folder you actually work in.
-    if [ "$WORK_DIR" != "$BASE_DIR/clickbench-run" ] && [ ! -e "$BASE_DIR/clickbench-run" ]; then
-        ln -s "$WORK_DIR" "$BASE_DIR/clickbench-run"
-        echo "Linked $BASE_DIR/clickbench-run -> $WORK_DIR"
     fi
 
     say "The clickhouse system directory — read these, they are all tiny"
@@ -474,12 +492,8 @@ step_results() {
     if [ -f "$CB_DIR/validate-results.py" ]; then
         say "Validating"
         (cd "$CB_DIR" && python3 validate-results.py "$SYSTEM/$out") || \
-            warn "Validator complained — expected for a non-EC2 'machine' name."
+            warn "Validator complained — check the report above."
     fi
-
-    warn "This file is for local study only. Do NOT open a PR with it: the"
-    warn "'machine' field must be a real EC2 instance type produced by a clean"
-    warn "run-benchmark.sh run for the dashboard to mean anything."
 }
 
 ###############################################################################
@@ -545,7 +559,7 @@ step_clean() {
     say "Removing the downloaded parquet files (keeps the loaded table)"
     rm -f "$SYS_DIR"/hits_*.parquet
     echo "To also drop the table:   clickhouse-client --query 'DROP TABLE IF EXISTS hits'"
-    echo "To remove everything:     rm -rf $WORK_DIR"
+    echo "To remove the checkout:   rm -rf $CB_DIR"
 }
 
 ###############################################################################
@@ -580,8 +594,10 @@ step_help() {
 #   all                 preflight -> ... -> bench -> results -> analyze
 #
 # Useful overrides:
-#   MACHINE=my-box                     label in the result JSON
+#   MACHINE=c7i.4xlarge                label in the result JSON
+#                                      (defaults to the EC2 instance type)
 #   WORK_DIR=/mnt/data/clickbench      where the checkout + dataset live
+#                                      (defaults to this script's directory)
 #   BENCH_TRIES=1                      fewer runs per query (smoke test)
 #   BENCH_CONCURRENT_DURATION=0        skip the 600 s concurrency window
 EOF
