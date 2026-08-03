@@ -1,7 +1,18 @@
 #!/usr/bin/env bash
 ###############################################################################
-# ClickBench on a 3-node ClickHouse cluster on AWS — publishable run
+# ClickBench hardware or distributed ClickHouse benchmark runner on AWS
 #
+# The default mode provisions one host and runs the upstream hardware suite:
+#
+#     MACHINE=c8i.4xlarge ./clickbench-cluster.sh provision
+#     ./clickbench-cluster.sh bootstrap
+#     ./clickbench-cluster.sh run
+#     ./clickbench-cluster.sh status
+#     ./clickbench-cluster.sh fetch-log
+#     ./clickbench-cluster.sh results
+#     ./clickbench-cluster.sh terminate
+#
+# Pass --suite clickbench for the distributed workflow documented below.
 # Companion to clickbench-local.sh. Read that one first: everything about the
 # 43 queries, the cold/hot cycle, the driver and the result JSON is the same.
 # This file only deals with what *changes* when there is more than one node.
@@ -83,27 +94,74 @@
 
 set -euo pipefail
 
+SUITE="${SUITE:-hardware}"
+STEP="help"
+
+parse_cli() {
+    local positional=()
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --suite)
+                [ "$#" -ge 2 ] || { echo "--suite requires hardware or clickbench" >&2; exit 2; }
+                SUITE="$2"
+                shift 2
+                ;;
+            --suite=*) SUITE="${1#*=}"; shift ;;
+            -h|--help) STEP="help"; shift ;;
+            -*) echo "Unknown option: $1" >&2; exit 2 ;;
+            *) positional+=("$1"); shift ;;
+        esac
+    done
+    [ "${#positional[@]}" -le 1 ] || { echo "Expected one step" >&2; exit 2; }
+    [ "${#positional[@]}" -eq 0 ] || STEP="${positional[0]}"
+    case "$SUITE" in hardware|clickbench) ;; *) echo "Unknown suite: $SUITE" >&2; exit 2 ;; esac
+}
+
+parse_cli "$@"
+
 BASE_DIR="${BASE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 
 # The name of the new ClickBench system directory. This is the PR artifact.
 SYSTEM="${SYSTEM:-clickhouse-cluster}"
 GEN_DIR="$BASE_DIR/$SYSTEM"
 
-# Cluster shape.
-NODE_COUNT="${NODE_COUNT:-3}"
+# Cluster shape. Hardware mode intentionally provisions one isolated host;
+# the hardware benchmark has no distributed result semantics.
+if [ "$SUITE" = "hardware" ]; then
+    NODE_COUNT="${NODE_COUNT:-1}"
+else
+    NODE_COUNT="${NODE_COUNT:-3}"
+fi
 CLUSTER_NAME="${CLUSTER_NAME:-cb}"
 
-# EC2. c6a.4xlarge + 500 GB gp2 + Ubuntu 24.04 is the ClickBench reference
-# configuration; keep it so the 3-node numbers sit next to the 1-node ones.
-MACHINE="${MACHINE:-c6a.4xlarge}"
+# EC2 defaults are suite-specific: C8i fills a missing hardware-suite family,
+# while c6a.4xlarge remains the main ClickBench reference shape.
+if [ "$SUITE" = "hardware" ]; then
+    MACHINE="${MACHINE:-c8i.4xlarge}"
+else
+    MACHINE="${MACHINE:-c6a.4xlarge}"
+fi
+HARDWARE_MACHINE="${HARDWARE_MACHINE:-AWS $MACHINE}"
+HARDWARE_COMMENT="${HARDWARE_COMMENT:-$HARDWARE_MACHINE}"
+HARDWARE_TAGS="${HARDWARE_TAGS:-[\"cloud\",\"aws\",\"intel\"]}"
+HARDWARE_STORAGE="${HARDWARE_STORAGE:-ebs}"
+case "$HARDWARE_STORAGE" in
+    ebs|instance-store) ;;
+    *) echo "HARDWARE_STORAGE must be ebs or instance-store" >&2; exit 2 ;;
+esac
 VOLUME_SIZE="${VOLUME_SIZE:-500}"
 VOLUME_TYPE="${VOLUME_TYPE:-gp2}"
 KEY_NAME="${KEY_NAME:-clickbench}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/$KEY_NAME.pem}"
 SSH_USER="${SSH_USER:-ubuntu}"
-SG_NAME="${SG_NAME:-clickbench-cluster}"
+if [ "$SUITE" = "hardware" ]; then
+    SG_NAME="${SG_NAME:-clickbench-hardware}"
+    TAG_NAME="${TAG_NAME:-clickbench-hardware}"
+else
+    SG_NAME="${SG_NAME:-clickbench-cluster}"
+    TAG_NAME="${TAG_NAME:-clickbench-cluster}"
+fi
 PG_NAME="${PG_NAME:-clickbench-cluster}"
-TAG_NAME="${TAG_NAME:-clickbench-cluster}"
 
 # Where the node-side checkout lives. Only the ClickBench checkout and the
 # generated system directory go here — the parquet files are downloaded
@@ -111,8 +169,13 @@ TAG_NAME="${TAG_NAME:-clickbench-cluster}"
 # ssh user's home directory is fine.
 NODE_WORK_DIR="${NODE_WORK_DIR:-/home/$SSH_USER/clickbench}"
 
-NODES_FILE="$BASE_DIR/nodes.env"
-LOG="$BASE_DIR/cluster-log"
+if [ "$SUITE" = "hardware" ]; then
+    NODES_FILE="${NODES_FILE:-$BASE_DIR/hardware-nodes.env}"
+    LOG="${LOG:-$BASE_DIR/hardware-remote-log}"
+else
+    NODES_FILE="${NODES_FILE:-$BASE_DIR/nodes.env}"
+    LOG="${LOG:-$BASE_DIR/cluster-log}"
+fi
 
 SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10"
 
@@ -120,10 +183,21 @@ say()  { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m[warn] %s\033[0m\n' "$*" >&2; }
 die()  { printf '\033[1;31m[fail] %s\033[0m\n' "$*" >&2; exit 1; }
 
+require_clickbench_suite() {
+    [ "$SUITE" = "clickbench" ] || die "Step '$STEP' is only available with --suite clickbench."
+}
+
 load_nodes() {
     [ -f "$NODES_FILE" ] || die "No $NODES_FILE — run the provision step first."
     # shellcheck disable=SC1090
     . "$NODES_FILE"
+    [ "${CB_SUITE:-$SUITE}" = "$SUITE" ] \
+        || die "$NODES_FILE belongs to suite '${CB_SUITE}', not '$SUITE'."
+    MACHINE="${CB_MACHINE:-$MACHINE}"
+    HARDWARE_MACHINE="${CB_HARDWARE_MACHINE:-$HARDWARE_MACHINE}"
+    HARDWARE_COMMENT="${CB_HARDWARE_COMMENT:-$HARDWARE_COMMENT}"
+    HARDWARE_TAGS="${CB_HARDWARE_TAGS:-$HARDWARE_TAGS}"
+    HARDWARE_STORAGE="${CB_HARDWARE_STORAGE:-$HARDWARE_STORAGE}"
 }
 
 # ssh to a node from here, by public IP.
@@ -139,6 +213,8 @@ step_preflight() {
         || die "AWS credentials are not usable — configure them first."
     echo "AWS identity: $(aws sts get-caller-identity --query Arn --output text)"
     echo "Region:       $(aws configure get region || echo '<unset — export AWS_DEFAULT_REGION>')"
+    echo "Suite:        $SUITE"
+    echo "Nodes:        $NODE_COUNT"
     command -v jq >/dev/null || die "jq is required."
 
     if [ ! -f "$SSH_KEY" ]; then
@@ -156,12 +232,11 @@ step_preflight() {
 
     cat <<EOF
 
-Cost, roughly, on-demand in us-east-1:
-    3 × $MACHINE            ~\$1.85 / hour
-    3 × ${VOLUME_SIZE} GB $VOLUME_TYPE           ~\$0.21 / hour
-A full run (install + 14 GB × 3 download + load + 43 queries × 3 tries with a
-cluster restart before each + the 600 s concurrency window) takes on the order
-of two hours. Budget a few dollars — and do not forget the terminate step.
+Cost depends on the selected instance and region:
+    $NODE_COUNT × $MACHINE
+    $NODE_COUNT × ${VOLUME_SIZE} GB $VOLUME_TYPE
+Verify current EC2 and EBS pricing before provisioning. The benchmark downloads
+about 14 GB and runs 43 queries three times. Do not forget the terminate step.
 EOF
 }
 
@@ -174,7 +249,8 @@ EOF
 ###############################################################################
 step_provision() {
     say "Resolving the network"
-    local subnet az vpc ami sg pg ids
+    local subnet az vpc ami sg ids
+    local -a placement_args
 
     # Default VPC, one subnet — every node must be in the SAME AZ, otherwise
     # inter-node traffic is cross-AZ (billed, and slower).
@@ -212,16 +288,20 @@ step_provision() {
         echo "reusing $sg"
     fi
 
-    say "Placement group (cluster strategy — lowest inter-node latency)"
-    aws ec2 create-placement-group --group-name "$PG_NAME" --strategy cluster >/dev/null 2>&1 \
-        && echo "created $PG_NAME" || echo "reusing $PG_NAME"
-    pg="$PG_NAME"
+    if [ "$SUITE" = "clickbench" ]; then
+        say "Placement group (cluster strategy — lowest inter-node latency)"
+        aws ec2 create-placement-group --group-name "$PG_NAME" --strategy cluster >/dev/null 2>&1 \
+            && echo "created $PG_NAME" || echo "reusing $PG_NAME"
+        placement_args=(--placement "GroupName=$PG_NAME,AvailabilityZone=$az")
+    else
+        placement_args=(--placement "AvailabilityZone=$az")
+    fi
 
     say "Launching $NODE_COUNT × $MACHINE"
     ids=$(aws ec2 run-instances --image-id "$ami" --instance-type "$MACHINE" \
         --count "$NODE_COUNT" --key-name "$KEY_NAME" \
         --security-group-ids "$sg" --subnet-id "$subnet" \
-        --placement "GroupName=$pg,AvailabilityZone=$az" \
+        "${placement_args[@]}" \
         --block-device-mappings "DeviceName=/dev/sda1,Ebs={DeleteOnTermination=true,VolumeSize=$VOLUME_SIZE,VolumeType=$VOLUME_TYPE}" \
         --instance-initiated-shutdown-behavior stop \
         --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$TAG_NAME}]" \
@@ -270,6 +350,14 @@ CB_SSH_USER="$SSH_USER"
 CB_SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 CB_WORK_DIR="$NODE_WORK_DIR"
 EOF
+    {
+        printf 'CB_SUITE=%q\n' "$SUITE"
+        printf 'CB_MACHINE=%q\n' "$MACHINE"
+        printf 'CB_HARDWARE_MACHINE=%q\n' "$HARDWARE_MACHINE"
+        printf 'CB_HARDWARE_COMMENT=%q\n' "$HARDWARE_COMMENT"
+        printf 'CB_HARDWARE_TAGS=%q\n' "$HARDWARE_TAGS"
+        printf 'CB_HARDWARE_STORAGE=%q\n' "$HARDWARE_STORAGE"
+    } >> "$NODES_FILE"
     say "Wrote $NODES_FILE"
     cat "$NODES_FILE"
 }
@@ -287,6 +375,7 @@ EOF
 # so run clickbench-local.sh fetch first (or set CB_DIR).
 ###############################################################################
 step_gen() {
+    require_clickbench_suite
     local cb_dir="${CB_DIR:-$BASE_DIR/ClickBench}"
     [ -d "$cb_dir/clickhouse" ] || die "No ClickBench checkout at $cb_dir — run ./clickbench-local.sh fetch, or set CB_DIR."
 
@@ -566,6 +655,29 @@ EOF
 ###############################################################################
 step_bootstrap() {
     load_nodes
+    if [ "$SUITE" = "hardware" ]; then
+        local pub0
+        pub0=$(awk '{print $1}' <<< "$CB_PUBLIC")
+        say "Waiting for ssh on $pub0"
+        until ssh_pub "$pub0" true 2>/dev/null; do sleep 5; done
+        if [ "$HARDWARE_STORAGE" = "instance-store" ]; then
+            say "Mounting the first EC2 instance-store NVMe device at $NODE_WORK_DIR"
+            ssh_pub "$pub0" "if ! findmnt -rn '$NODE_WORK_DIR' >/dev/null; then \
+                device=\$(lsblk -dpno NAME,MODEL | awk '/Instance Storage/ {print \$1; exit}'); \
+                [ -n \"\$device\" ] || { echo 'No EC2 instance-store NVMe device found' >&2; exit 1; }; \
+                sudo mkdir -p '$NODE_WORK_DIR'; \
+                sudo blkid \"\$device\" >/dev/null 2>&1 || sudo mkfs.ext4 -F \"\$device\"; \
+                sudo mount \"\$device\" '$NODE_WORK_DIR'; \
+                sudo chown '$SSH_USER:$SSH_USER' '$NODE_WORK_DIR'; \
+            fi; findmnt '$NODE_WORK_DIR'"
+        fi
+        say "Cloning ClickBench on the hardware benchmark host"
+        ssh_pub "$pub0" "mkdir -p $NODE_WORK_DIR && \
+            { [ -d $NODE_WORK_DIR/ClickBench/.git ] || git clone --depth 1 https://github.com/ClickHouse/ClickBench.git $NODE_WORK_DIR/ClickBench; }"
+        echo "Host is ready. Start it with: $0 --suite hardware run"
+        return
+    fi
+
     [ -d "$GEN_DIR" ] || die "Run the gen step first."
     local node0 pub0
     node0=$(awk '{print $1}' <<< "$CB_NODES")
@@ -606,6 +718,15 @@ step_bootstrap() {
 step_run() {
     load_nodes
     local pub0; pub0=$(awk '{print $1}' <<< "$CB_PUBLIC")
+    if [ "$SUITE" = "hardware" ]; then
+        say "Starting the upstream hardware benchmark on $pub0"
+        ssh_pub "$pub0" "cd $NODE_WORK_DIR && \
+            setsid nohup bash ClickBench/hardware/hardware.sh > hardware-log 2>&1 < /dev/null & \
+            echo started"
+        echo "Follow it with: $0 --suite hardware status"
+        return
+    fi
+
     local dir="$NODE_WORK_DIR/ClickBench/$SYSTEM"
 
     say "Starting the run on node0 ($pub0)"
@@ -626,6 +747,14 @@ step_run() {
 step_status() {
     load_nodes
     local pub0; pub0=$(awk '{print $1}' <<< "$CB_PUBLIC")
+    if [ "$SUITE" = "hardware" ]; then
+        say "Hardware benchmark progress"
+        ssh_pub "$pub0" "cd $NODE_WORK_DIR && \
+            echo \"query result lines: \$(grep -cE '^\\[' hardware-log 2>/dev/null || true) / 43\"; \
+            echo '--- tail ---'; tail -n 15 hardware-log"
+        return
+    fi
+
     local dir="$NODE_WORK_DIR/ClickBench/$SYSTEM"
     say "Progress"
     ssh_pub "$pub0" "cd $dir && \
@@ -643,6 +772,12 @@ step_ssh0() {
 step_fetch_log() {
     load_nodes
     local pub0; pub0=$(awk '{print $1}' <<< "$CB_PUBLIC")
+    if [ "$SUITE" = "hardware" ]; then
+        scp $SSH_OPTS -i "$SSH_KEY" "$SSH_USER@$pub0:$NODE_WORK_DIR/hardware-log" "$LOG"
+        say "Fetched $LOG ($(grep -cE '^\[' "$LOG") query lines)"
+        return
+    fi
+
     scp $SSH_OPTS -i "$SSH_KEY" "$SSH_USER@$pub0:$NODE_WORK_DIR/ClickBench/$SYSTEM/log" "$LOG"
     scp $SSH_OPTS -i "$SSH_KEY" "$SSH_USER@$pub0:$NODE_WORK_DIR/ClickBench/$SYSTEM/result.csv" "$BASE_DIR/cluster-result.csv" 2>/dev/null || true
     say "Fetched $LOG ($(grep -cE '^\[' "$LOG") query lines)"
@@ -656,6 +791,37 @@ step_fetch_log() {
 ###############################################################################
 step_results() {
     [ -s "$LOG" ] || die "No log at $LOG — run the fetch-log step first."
+    if [ "$SUITE" = "hardware" ]; then
+        local cb_dir="${CB_DIR:-$BASE_DIR/ClickBench}"
+        [ -d "$cb_dir/hardware/results" ] || die "No ClickBench checkout at $cb_dir — clone it or set CB_DIR."
+        jq -e 'type == "array"' <<< "$HARDWARE_TAGS" >/dev/null \
+            || die "HARDWARE_TAGS must be a JSON array."
+
+        say "Building the hardware result JSON"
+        local results n name out
+        results=$(grep -E '^\[' "$LOG" | sed 's/,$//' | jq -s .)
+        n=$(jq 'length' <<< "$results")
+        [ "$n" -eq 43 ] || die "Got $n query rows, expected 43; refusing to create a publishable result."
+        jq -e 'all(.[]; type == "array" and length == 3)' <<< "$results" >/dev/null \
+            || die "Every hardware query must contain exactly three timings."
+        name="${HARDWARE_RESULT_NAME:-$(tr '[:upper:] .' '[:lower:]__' <<< "$HARDWARE_MACHINE" | tr -cd 'a-z0-9_-' | sed 's/__*/_/g; s/^_//; s/_$//')}"
+        [ -n "$name" ] || die "Could not derive a result filename; set HARDWARE_RESULT_NAME."
+        out="$cb_dir/hardware/results/$name.json"
+        jq -n \
+            --arg machine "$HARDWARE_MACHINE" \
+            --arg comment "$HARDWARE_COMMENT" \
+            --arg time "$(date -u '+%Y-%m-%d %H:%M:%S')" \
+            --argjson tags "$HARDWARE_TAGS" \
+            --argjson result "$results" \
+            '{machine: $machine, comment: $comment, time: $time, tags: $tags, result: $result}' > "$out"
+        jq empty "$out"
+        (cd "$cb_dir/hardware" && ./generate-results.sh)
+        rm -f "$cb_dir/hardware/index.html.bak"
+        say "Wrote $out and regenerated hardware/index.html"
+        jq 'del(.result)' "$out"
+        return
+    fi
+
     say "Building the result JSON"
     local load_time data_size qps err_ratio results n date_dir out
     load_time=$(grep -m1 '^Load time: ' "$LOG" | awk '{printf "%.0f", $3}')
@@ -710,6 +876,28 @@ step_results() {
 ###############################################################################
 step_submit() {
     local cb_dir="${CB_DIR:-$BASE_DIR/ClickBench}"
+    if [ "$SUITE" = "hardware" ]; then
+        local name="${HARDWARE_RESULT_NAME:-$(tr '[:upper:] .' '[:lower:]__' <<< "$HARDWARE_MACHINE" | tr -cd 'a-z0-9_-' | sed 's/__*/_/g; s/^_//; s/_$//')}"
+        [ -n "$name" ] || die "Could not derive a result filename; set HARDWARE_RESULT_NAME."
+        local result="$cb_dir/hardware/results/$name.json"
+        [ -f "$result" ] || die "No $result — run fetch-log and results first."
+        jq -e '.result | length == 43 and all(.[]; length == 3)' "$result" >/dev/null \
+            || die "Hardware result does not contain 43 three-try rows."
+        cat <<EOF
+
+$(printf '\033[1;36m==> Hardware pull request checklist\033[0m')
+
+  1. Review $result and hardware/index.html.
+  2. Confirm the machine, CPU generation, vCPU, RAM, and storage in comment.
+  3. Commit only those two files on a branch based on ClickHouse/ClickBench main.
+  4. State that the unmodified hardware/hardware.sh script was used and include
+     the AWS region, availability zone, volume type/size, and ClickHouse version.
+  5. Open the PR against ClickHouse/ClickBench and link the superseded PR #1161.
+
+EOF
+        return
+    fi
+
     say "Validating the result file"
     if [ -f "$cb_dir/validate-results.py" ]; then
         # The validator walks <system>/results/*/*.json relative to a root, so
@@ -777,22 +965,35 @@ step_terminate() {
 ###############################################################################
 step_help() {
     sed -n 's/^# \{0,1\}//p' <<'EOF'
+# Usage:
+#   ./clickbench-cluster.sh [--suite hardware|clickbench] <step>
+#
+# The default suite is hardware: provision one EC2 host, run upstream
+# hardware/hardware.sh, and create hardware/results/<machine>.json.
+# Use --suite clickbench for the existing multi-node distributed benchmark.
+#
 # Steps:
 #   preflight    awscli, credentials, ssh key, cost estimate
-#   provision    security group, placement group, 3 × EC2, write nodes.env
+#   provision    launch 1 hardware host or the ClickBench cluster
 #   nodes        re-read the running instances into nodes.env
-#   gen          generate the clickhouse-cluster system directory here
-#   bootstrap    ssh trust, clone ClickBench on node0, push the directory
+#   gen          generate the distributed system directory (clickbench only)
+#   bootstrap    prepare storage and benchmark files on the remote host(s)
 #   run          start the measured run, detached, on node0
 #   status       progress and log tail
 #   ssh0         interactive shell on the initiator
 #   fetch-log    bring the log (and result.csv) back here
-#   results      log -> clickhouse-cluster/results/<date>/<machine>.json
+#   results      create the selected suite's result JSON and generated page
 #   submit       validate + pull request checklist
 #   terminate    terminate the instances (asks for confirmation)
 #
 # Useful overrides:
-#   MACHINE=c6a.8xlarge        instance type (also the result's machine field)
+#   SUITE=hardware|clickbench  same as --suite (default: hardware)
+#   MACHINE=c8i.4xlarge        EC2 shape (hardware default; ClickBench uses c6a.4xlarge)
+#   HARDWARE_MACHINE="AWS c8i.4xlarge (Intel Xeon 6)"
+#   HARDWARE_COMMENT="AWS c8i.4xlarge, 16 vCPU, 32 GiB RAM, gp3 EBS"
+#   HARDWARE_TAGS='["cloud","aws","intel"]'
+#   HARDWARE_RESULT_NAME=aws_c8i_4xlarge
+#   HARDWARE_STORAGE=ebs|instance-store   use instance-store for I7i/I4i
 #   NODE_COUNT=5               shards
 #   KEY_NAME / SSH_KEY         EC2 key pair and the matching .pem
 #   CB_DIR=/path/to/ClickBench checkout used by gen and submit
@@ -803,7 +1004,7 @@ step_help() {
 EOF
 }
 
-case "${1:-help}" in
+case "$STEP" in
     preflight)      step_preflight ;;
     provision)      step_provision ;;
     nodes)          step_nodes ;;
@@ -817,5 +1018,5 @@ case "${1:-help}" in
     submit)         step_submit ;;
     terminate)      step_terminate ;;
     help|-h|--help) step_help ;;
-    *)              die "Unknown step '$1' — try: $0 help" ;;
+    *)              die "Unknown step '$STEP' — try: $0 help" ;;
 esac

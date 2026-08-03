@@ -6,7 +6,8 @@
 # readable and copy-paste-able on its own. Later, when you are comfortable,
 # just run the whole thing:
 #
-#     ./clickbench-local.sh all
+#     ./clickbench-local.sh all                         # hardware suite (default)
+#     ./clickbench-local.sh --suite clickbench all      # main ClickBench suite
 #
 # Or run one step at a time (recommended the first time):
 #
@@ -23,6 +24,9 @@
 #     ./clickbench-local.sh stop
 #
 #     ./clickbench-local.sh help           # list all steps
+#
+# The default suite is `hardware`, which runs upstream hardware/hardware.sh.
+# Pass `--suite clickbench` to use the cross-database workflow described below.
 #
 # ---------------------------------------------------------------------------
 # HOW CLICKBENCH IS STRUCTURED (as of 2026)
@@ -64,7 +68,7 @@
 # ---------------------------------------------------------------------------
 # WHAT "PUBLISHABLE" MEANS
 #
-# Official results come from run-benchmark.sh, which boots a *fresh* Ubuntu
+# Main ClickBench results come from run-benchmark.sh, which boots a *fresh* Ubuntu
 # 24.04 EC2 VM with a 500 GB gp2 root volume, feeds it cloud-init.sh, runs
 # benchmark.sh unattended, ships the log to play.clickhouse.com, and a bot
 # turns that log into clickhouse/results/<YYYYMMDD>/<machine>.json.
@@ -80,6 +84,31 @@
 ###############################################################################
 
 set -euo pipefail
+
+SUITE="${SUITE:-hardware}"
+STEP="help"
+
+parse_cli() {
+    local positional=()
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --suite)
+                [ "$#" -ge 2 ] || { echo "--suite requires hardware or clickbench" >&2; exit 2; }
+                SUITE="$2"
+                shift 2
+                ;;
+            --suite=*) SUITE="${1#*=}"; shift ;;
+            -h|--help) STEP="help"; shift ;;
+            -*) echo "Unknown option: $1" >&2; exit 2 ;;
+            *) positional+=("$1"); shift ;;
+        esac
+    done
+    [ "${#positional[@]}" -le 1 ] || { echo "Expected one step" >&2; exit 2; }
+    [ "${#positional[@]}" -eq 0 ] || STEP="${positional[0]}"
+    case "$SUITE" in hardware|clickbench) ;; *) echo "Unknown suite: $SUITE" >&2; exit 2 ;; esac
+}
+
+parse_cli "$@"
 
 # --------------------------------------------------------------------------- 
 # Configuration. Everything is overridable from the environment, e.g.
@@ -98,7 +127,7 @@ set -euo pipefail
 # so preflight adds the missing o+x bits — see ensure_traversable below.
 BASE_DIR="${BASE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 WORK_DIR="${WORK_DIR:-$BASE_DIR}"                  # repo checkout + dataset
-CB_DIR="$WORK_DIR/ClickBench"                      # the git checkout
+CB_DIR="${CB_DIR:-$WORK_DIR/ClickBench}"           # the git checkout
 SYSTEM="${SYSTEM:-clickhouse}"                     # which ClickBench system dir
 SYS_DIR="$CB_DIR/$SYSTEM"
 
@@ -115,6 +144,9 @@ ec2_instance_type() {
         http://169.254.169.254/latest/meta-data/instance-type 2>/dev/null
 }
 MACHINE="${MACHINE:-$(ec2_instance_type || echo "local-$(hostname)")}"
+HARDWARE_MACHINE="${HARDWARE_MACHINE:-AWS $MACHINE}"
+HARDWARE_COMMENT="${HARDWARE_COMMENT:-$HARDWARE_MACHINE, $(nproc) vCPU, $(free -g | awk '/^Mem:/ {print $2}') GiB RAM}"
+HARDWARE_TAGS="${HARDWARE_TAGS:-[\"cloud\",\"aws\",\"intel\"]}"
 
 # Driver knobs (read by lib/benchmark-common.sh). Defaults shown are upstream's.
 export BENCH_TRIES="${BENCH_TRIES:-3}"                                 # runs per query
@@ -122,7 +154,11 @@ export BENCH_CONCURRENT_CONNECTIONS="${BENCH_CONCURRENT_CONNECTIONS:-10}"
 export BENCH_CONCURRENT_DURATION="${BENCH_CONCURRENT_DURATION:-600}"   # 0 = skip QPS test
 export HOME="${HOME:-$(getent passwd "$(id -u)" | cut -d: -f6)}"        # driver expects a real HOME
 
-LOG="$SYS_DIR/log"                                 # full benchmark log
+if [ "$SUITE" = "hardware" ]; then
+    LOG="${LOG:-$WORK_DIR/hardware-log}"
+else
+    LOG="${LOG:-$SYS_DIR/log}"
+fi
 
 # The reference machine every ClickBench number is normalised against.
 REF_MACHINE="c6a.4xlarge (16 vCPU, 32 GiB RAM, 500 GB gp2)"
@@ -130,6 +166,10 @@ REF_MACHINE="c6a.4xlarge (16 vCPU, 32 GiB RAM, 500 GB gp2)"
 say()  { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m[warn] %s\033[0m\n' "$*" >&2; }
 die()  { printf '\033[1;31m[fail] %s\033[0m\n' "$*" >&2; exit 1; }
+
+require_clickbench_suite() {
+    [ "$SUITE" = "clickbench" ] || die "Step '$STEP' is only available with --suite clickbench. Hardware mode uses the upstream all-in-one hardware.sh driver."
+}
 
 # The server reads the dataset as the 'clickhouse' user, so every directory on
 # the way to the parquet files must be traversable by it. Add the missing o+x
@@ -195,7 +235,8 @@ step_preflight() {
     echo "CPU:       $(nproc) logical cores — $(lscpu | sed -n 's/^Model name: *//p' | head -1)"
     echo "RAM:       $(free -g | awk '/^Mem:/ {print $2}') GiB"
     echo "Machine:   $MACHINE"
-    echo "Reference: $REF_MACHINE"
+    echo "Suite:     $SUITE"
+    [ "$SUITE" = "hardware" ] || echo "Reference: $REF_MACHINE"
 
     # Space: ~14 GB of parquet + ~15 GB of MergeTree data + room for merges.
     local avail_work avail_var
@@ -203,16 +244,23 @@ step_preflight() {
     avail_work=$(df -BG --output=avail "$WORK_DIR" | tail -1 | tr -dc '0-9')
     avail_var=$(df -BG --output=avail /var 2>/dev/null | tail -1 | tr -dc '0-9')
     echo
-    echo "Free space in $WORK_DIR: ${avail_work} GiB (need ~20 for the parquet dataset)"
-    echo "Free space in /var:      ${avail_var} GiB (need ~30 for /var/lib/clickhouse)"
-    (( avail_work >= 25 )) || die "Not enough space for the dataset."
-    (( avail_var  >= 35 )) || die "Not enough space for /var/lib/clickhouse."
+    if [ "$SUITE" = "hardware" ]; then
+        echo "Free space in $WORK_DIR: ${avail_work} GiB (need ~35 for ClickHouse data and working space)"
+        (( avail_work >= 35 )) || die "Not enough space for the hardware benchmark."
+    else
+        echo "Free space in $WORK_DIR: ${avail_work} GiB (need ~20 for the parquet dataset)"
+        echo "Free space in /var:      ${avail_var} GiB (need ~30 for /var/lib/clickhouse)"
+        (( avail_work >= 25 )) || die "Not enough space for the dataset."
+        (( avail_var  >= 35 )) || die "Not enough space for /var/lib/clickhouse."
+    fi
 
     # A non-traversable directory anywhere above the dataset breaks the load
     # step; Ubuntu creates home directories 0750, so this usually fixes one.
-    say "Checking that the clickhouse user can reach $WORK_DIR"
-    ensure_traversable "$WORK_DIR"
-    assert_daemon_can_read "$WORK_DIR" && echo "OK — path is traversable."
+    if [ "$SUITE" = "clickbench" ]; then
+        say "Checking that the clickhouse user can reach $WORK_DIR"
+        ensure_traversable "$WORK_DIR"
+        assert_daemon_can_read "$WORK_DIR" && echo "OK — path is traversable."
+    fi
 
     # The driver drops the page cache before every cold run. Without this the
     # cold numbers are fiction.
@@ -253,6 +301,13 @@ step_fetch() {
         git clone --depth 1 "$CB_REPO" --branch "$CB_BRANCH" "$CB_DIR"
     fi
 
+    if [ "$SUITE" = "hardware" ]; then
+        say "Hardware benchmark driver"
+        ls -la "$CB_DIR/hardware"/{hardware.sh,queries.sql,generate-results.sh}
+        echo "Queries: $(grep -cve '^[[:space:]]*$' "$CB_DIR/hardware/queries.sql")"
+        return
+    fi
+
     say "The clickhouse system directory — read these, they are all tiny"
     ls -la "$SYS_DIR"
     echo
@@ -278,6 +333,7 @@ step_fetch() {
 #      "tuning", it just moves work out of the measured query window.
 ###############################################################################
 step_install_clickhouse() {
+    require_clickbench_suite
     say "Installing ClickHouse"
     cd "$SYS_DIR"
     ./install
@@ -293,6 +349,7 @@ step_install_clickhouse() {
 # STEP: start / stop / check — the daemon lifecycle the driver uses
 ###############################################################################
 step_start() {
+    require_clickbench_suite
     say "Starting the server and probing it"
     cd "$SYS_DIR"
     # `clickhouse start` exits 2 when the server is already up. lib/benchmark-common.sh
@@ -308,6 +365,7 @@ step_start() {
 }
 
 step_stop() {
+    require_clickbench_suite
     say "Stopping the server"
     cd "$SYS_DIR"
     ./stop
@@ -338,6 +396,7 @@ ensure_server_up() {
 #   https://datasets.clickhouse.com/hits_compatible/hits.parquet   (single file)
 ###############################################################################
 step_download() {
+    require_clickbench_suite
     say "Downloading the hits dataset (100 parquet files) into $SYS_DIR"
     cd "$SYS_DIR"
     ../lib/download-hits-parquet-partitioned
@@ -363,6 +422,7 @@ step_download() {
 # by the driver during `bench`, not this one. Doing it here is just to see it.
 ###############################################################################
 step_load() {
+    require_clickbench_suite
     say "Loading the dataset (this is the same ./load the driver times)"
     cd "$SYS_DIR"
     allow_user_files_glob
@@ -395,6 +455,18 @@ step_load() {
 #     BENCH_CONCURRENT_DURATION=0 BENCH_TRIES=1 ./clickbench-local.sh bench
 ###############################################################################
 step_bench() {
+    if [ "$SUITE" = "hardware" ]; then
+        [ -x "$CB_DIR/hardware/hardware.sh" ] || die "No hardware driver at $CB_DIR/hardware/hardware.sh — run the fetch step first."
+        say "Running the upstream hardware benchmark — output is tee'd to $LOG"
+        mkdir -p "$WORK_DIR"
+        cd "$WORK_DIR"
+        : > "$LOG"
+        "$CB_DIR/hardware/hardware.sh" 2>&1 | tee -a "$LOG"
+        say "Hardware benchmark complete"
+        echo "Query result lines: $(grep -cE '^\[' "$LOG") (expect 43)"
+        return
+    fi
+
     say "Running the full benchmark — output is tee'd to $LOG"
     cd "$SYS_DIR"
     allow_user_files_glob
@@ -433,6 +505,7 @@ step_bench() {
 # Output: the same "[t1, t2, t3]," lines, plus result.csv (<query>,<try>,<secs>).
 ###############################################################################
 step_sweep() {
+    require_clickbench_suite
     say "Query sweep only (assumes the table is already loaded)"
     cd "$SYS_DIR"
     clickhouse-client --query "SELECT count() FROM hits" >/dev/null \
@@ -461,6 +534,37 @@ step_sweep() {
 # object locally from template.json + the parsed log.
 ###############################################################################
 step_results() {
+    if [ "$SUITE" = "hardware" ]; then
+        say "Building the hardware result JSON from $LOG"
+        [ -s "$LOG" ] || die "No log at $LOG — run the bench step first."
+        jq -e 'type == "array"' <<< "$HARDWARE_TAGS" >/dev/null \
+            || die "HARDWARE_TAGS must be a JSON array."
+
+        local results n name out
+        results=$(grep -E '^\[' "$LOG" | sed 's/,$//' | jq -s .)
+        n=$(jq 'length' <<< "$results")
+        [ "$n" -eq 43 ] || die "Got $n query rows, expected 43; refusing to create a publishable result."
+        jq -e 'all(.[]; type == "array" and length == 3)' <<< "$results" >/dev/null \
+            || die "Every hardware query must contain exactly three timings."
+
+        name="${HARDWARE_RESULT_NAME:-$(tr '[:upper:] .' '[:lower:]__' <<< "$HARDWARE_MACHINE" | tr -cd 'a-z0-9_-' | sed 's/__*/_/g; s/^_//; s/_$//')}"
+        [ -n "$name" ] || die "Could not derive a result filename; set HARDWARE_RESULT_NAME."
+        out="$CB_DIR/hardware/results/$name.json"
+        jq -n \
+            --arg machine "$HARDWARE_MACHINE" \
+            --arg comment "$HARDWARE_COMMENT" \
+            --arg time "$(date -u '+%Y-%m-%d %H:%M:%S')" \
+            --argjson tags "$HARDWARE_TAGS" \
+            --argjson result "$results" \
+            '{machine: $machine, comment: $comment, time: $time, tags: $tags, result: $result}' > "$out"
+        jq empty "$out"
+        (cd "$CB_DIR/hardware" && ./generate-results.sh)
+        rm -f "$CB_DIR/hardware/index.html.bak"
+        say "Wrote $out and regenerated hardware/index.html"
+        jq 'del(.result)' "$out"
+        return
+    fi
+
     say "Building the result JSON from $LOG"
     [ -s "$LOG" ] || die "No log at $LOG — run the bench step first."
     cd "$SYS_DIR"
@@ -528,6 +632,7 @@ step_results() {
 # which are memory-bandwidth bound, and which saturate cores.
 ###############################################################################
 step_analyze() {
+    require_clickbench_suite
     say "Cold vs hot per query (from $LOG)"
     grep -E '^\[' "$LOG" | sed 's/[][,]/ /g' | \
     awk '{ q++; cold=$1; hot=($2<$3?$2:$3);
@@ -578,6 +683,12 @@ step_analyze() {
 # STEP: clean — free the disk / start over
 ###############################################################################
 step_clean() {
+    if [ "$SUITE" = "hardware" ]; then
+        say "Removing hardware benchmark data"
+        rm -rf "$WORK_DIR/clickhouse-benchmark"
+        rm -f "$LOG"
+        return
+    fi
     say "Removing the downloaded parquet files (keeps the loaded table)"
     rm -f "$SYS_DIR"/hits_*.parquet
     echo "To also drop the table:   clickhouse-client --query 'DROP TABLE IF EXISTS hits'"
@@ -591,6 +702,11 @@ step_all() {
     step_preflight
     step_deps
     step_fetch
+    if [ "$SUITE" = "hardware" ]; then
+        step_bench
+        step_results
+        return
+    fi
     step_install_clickhouse
     step_start
     step_bench          # re-does download + load itself, timed correctly
@@ -600,6 +716,13 @@ step_all() {
 
 step_help() {
     sed -n 's/^# \{0,1\}//p' <<'EOF'
+# Usage:
+#   ./clickbench-local.sh [--suite hardware|clickbench] <step>
+#
+# The default suite is hardware. It uses upstream hardware/hardware.sh and
+# produces hardware/results/<machine>.json plus a regenerated hardware page.
+# Use --suite clickbench for the main cross-database ClickBench workflow.
+#
 # Steps:
 #   preflight           check OS, disk, RAM, drop_caches permission
 #   deps                apt-get install wget curl git jq python3
@@ -610,14 +733,19 @@ step_help() {
 #   load                create.sql + INSERT, with sanity checks
 #   bench               the official measured run -> log
 #   sweep               43-query cold/hot sweep only, no reload
-#   results             parse the log into results/<date>/<machine>.json
+#   results             parse the log and create the selected suite's JSON
 #   analyze             cold-vs-hot breakdown + query_log + storage stats
-#   clean               delete the parquet files
+#   clean               delete the selected suite's downloaded data
 #   all                 preflight -> ... -> bench -> results -> analyze
 #
 # Useful overrides:
+#   SUITE=hardware|clickbench            same as --suite (default: hardware)
 #   MACHINE=c7i.4xlarge                label in the result JSON
 #                                      (defaults to the EC2 instance type)
+#   HARDWARE_MACHINE="AWS c8i.4xlarge (Intel Xeon 6)"
+#   HARDWARE_COMMENT="AWS c8i.4xlarge, 16 vCPU, 32 GiB RAM, gp3 EBS"
+#   HARDWARE_TAGS='["cloud","aws","intel"]'
+#   HARDWARE_RESULT_NAME=aws_c8i_4xlarge
 #   WORK_DIR=/mnt/data/clickbench      where the checkout + dataset live
 #                                      (defaults to this script's directory)
 #   BENCH_TRIES=1                      fewer runs per query (smoke test)
@@ -625,7 +753,7 @@ step_help() {
 EOF
 }
 
-case "${1:-help}" in
+case "$STEP" in
     preflight)          step_preflight ;;
     deps)               step_deps ;;
     fetch)              step_fetch ;;
@@ -641,5 +769,5 @@ case "${1:-help}" in
     clean)              step_clean ;;
     all)                step_all ;;
     help|-h|--help)     step_help ;;
-    *)                  die "Unknown step '$1' — try: $0 help" ;;
+    *)                  die "Unknown step '$STEP' — try: $0 help" ;;
 esac
